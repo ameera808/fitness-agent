@@ -154,6 +154,12 @@
   .sub-tag { color: var(--warn); }
   .sub-tag a { color: var(--accent); cursor: pointer; text-decoration: underline; }
   .sub-panel { margin-top: 8px; }
+  a.linklike { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  button.toggle-on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .split-line { display: grid; grid-template-columns: 42px 1fr 1fr 1fr; gap: 8px; align-items: end; margin-top: 6px; }
+  .split-line .split-no { font-size: 0.74rem; color: var(--muted); padding-bottom: 9px; }
+  .splitlbl { font-size: 0.7rem; color: var(--muted); }
+  .splitlbl input { padding: 8px; text-align: center; }
 
   .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .stat { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 12px; text-align: center; }
@@ -266,7 +272,16 @@
           </div>
         </label>
       </div>
+      <div class="row">
+        <label class="field" style="flex:1; margin-bottom:0;">
+          <span class="lbl">Week of (any date in the week)</span>
+          <input type="date" id="week-of">
+          <span class="inline-note" id="week-of-note"></span>
+        </label>
+      </div>
     </div>
+
+    <div id="deload-nudge"></div>
 
     <h3>Planned days</h3>
     <p class="help">Pick the day, the workout, and the equipment you'll have. Weekdays default to your apartment gym, weekends to the commercial gym.</p>
@@ -387,6 +402,7 @@ const LS = {
   logs:    'fa_logs',
   swaps:   'fa_swaps',
   ui:      'fa_ui',
+  cycle:   'fa_cycle',
 };
 
 function load(key, fallback) {
@@ -429,6 +445,20 @@ function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&
 const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const EQUIP_LABEL = { commercial: 'Commercial gym', apartment: 'Apartment gym', travel: 'Travel / hotel' };
 function todayDayName() { return DAYS[new Date().getDay()]; }
+// Calendar date for a weekday within a Sunday-start week (weekId = the Sunday's ISO date).
+function dateForWeekday(weekId, dayName) {
+  const base = new Date(weekId + 'T00:00:00');
+  const idx = DAYS.indexOf(dayName);
+  base.setDate(base.getDate() + (idx < 0 ? 0 : idx));
+  return isoDate(base);
+}
+// Stable per-day key (uses the planned day's stable id, falling back to weekday name for old data).
+function dayKeyOf(d) { return d.id || d.day; }
+function cycleKey(weekId, d) { return weekId + '|' + dayKeyOf(d); }
+// Session grouping: one session = one exercise on one planned day of one week.
+function logSessionMatch(l, weekId, dayId, name) {
+  return l.weekId === weekId && ((l.slot || l.day) === dayId) && l.exercise === name;
+}
 
 /* ============================================================
    Default program template
@@ -474,13 +504,13 @@ function buildDefaultProgram() {
       name: 'Upper Hypertrophy', focus: 'Volume - arms / back / delts', minutes: 60,
       warmup: WARM_UPPER, cooldown: COOL,
       exercises: [
-        ex('uh_incline','Incline Press','Incline Chest Press Machine','Incline Dumbbell Press','Decline Push-up',3,'8-10',120,9,'Stretch at the bottom, controlled tempo.',5),
+        ex('uh_incline','Incline Press','Incline Chest Press Machine','Incline Dumbbell Press','Decline Push-up',4,'8-10',120,9,'Stretch at the bottom, controlled tempo.',5),
         ex('uh_row','Horizontal Pull','Seated Cable Row','Cable Row','Band Row',4,'10-12',120,9,'Squeeze 1 second at the back each rep.',5),
         ex('uh_pulldown','Vertical Pull','Lat Pulldown','Cable Lat Pulldown','Band Pulldown',3,'10-12',90,9,'Drive elbows down and back.',5),
         ex('uh_lat','Side Delt','Cable Lateral Raise','Dumbbell Lateral Raise','Band Lateral Raise',4,'12-15',60,9,'Lead with the elbows, slight forward lean.',2.5),
         ex('uh_rear','Rear Delt','Reverse Pec Deck','Dumbbell Rear Delt Fly','Band Pull-Apart',3,'15',60,9,'Pinch shoulder blades, no momentum.',2.5),
-        ex('uh_curl','Biceps','Cable Curl','Dumbbell Curl','Band Curl',3,'12',60,9,'Constant tension, full squeeze.',2.5),
-        ex('uh_tri','Triceps','Cable Triceps Pushdown','Cable Triceps Pushdown','Band Pushdown',3,'12',60,9,'Elbows pinned, full lockout.',2.5),
+        ex('uh_curl','Biceps','Incline Dumbbell Curl','Incline Dumbbell Curl','Band Curl (arm behind torso)',3,'10-12',60,9,'Let the arm hang back for a full stretch each rep.',2.5),
+        ex('uh_tri','Triceps','Overhead Cable Triceps Extension','Overhead Dumbbell Triceps Extension','Band Overhead Triceps Extension',3,'10-12',60,9,'Reach for a deep stretch overhead, full lockout.',2.5),
       ],
     },
     lowerHypertrophy: {
@@ -553,6 +583,7 @@ let profile = load(LS.profile, null) || defaultProfile();
 let weeks   = load(LS.weeks, []);
 let logs    = load(LS.logs, []);
 let swaps   = load(LS.swaps, {});
+let cycle   = load(LS.cycle, {});
 
 // Program: auto-upgrade to new defaults if the saved program was never user-edited.
 let program;
@@ -591,35 +622,45 @@ function allExerciseNames() {
 /* ============================================================
    Progression / suggestions / analysis
    ============================================================ */
-function logEntriesFor(name, equip) {
-  return logs
-    .filter(l => l.exercise === name && l.equipment === equip && l.weight != null && l.weight !== '')
-    .sort((a, b) => (a.date < b.date ? 1 : -1));
+// Group an exercise's logs into per-session summaries (handles combined + split-set entries).
+function sessionsFor(name, equip) {
+  const entries = logs.filter(l => l.exercise === name && (equip == null || l.equipment === equip) && l.weight != null && l.weight !== '');
+  const map = {};
+  entries.forEach(l => {
+    const k = l.weekId + '|' + (l.slot || l.day);
+    const g = map[k] || (map[k] = { key: k, weekId: l.weekId, date: l.date, equipment: l.equipment, topWeight: 0, topReps: 0, topRpe: null, volume: 0 });
+    const w = parseFloat(l.weight) || 0;
+    if (w > g.topWeight) { g.topWeight = w; g.topReps = parseInt(l.reps, 10) || 0; g.topRpe = (l.rpe == null ? null : l.rpe); }
+    g.volume += (l.volume || 0);
+  });
+  return Object.values(map).sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 function suggestWeight(exerciseName, equip, targetReps, deload, inc) {
   inc = (inc == null) ? 2.5 : inc;
-  const matches = logEntriesFor(exerciseName, equip);
-  if (!matches.length) return null;
-  const last = matches[0];
-  const lastW = parseFloat(last.weight);
-  if (isNaN(lastW)) return null;
+  const ses = sessionsFor(exerciseName, equip);
+  if (!ses.length) return null;
+  const last = ses[0];
+  const lastW = last.topWeight;
+  if (!lastW || isNaN(lastW)) return null;
   if (deload) return Math.round(lastW * 0.6 * 2) / 2;
   // True double progression: advance once the top of the rep range is reached (RPE no longer blocks).
-  const hitReps = (parseInt(last.reps, 10) || 0) >= targetReps;
+  const hitReps = (last.topReps || 0) >= targetReps;
   if (hitReps) return lastW + inc;
   return lastW;
 }
 function lastSession(name, equip) {
-  const m = logEntriesFor(name, equip);
-  return m.length ? m[0] : null;
+  const ses = sessionsFor(name, equip);
+  if (!ses.length) return null;
+  const s = ses[0];
+  return { weight: s.topWeight, reps: s.topReps, rpe: s.topRpe };
 }
 function detectPlateau(name, equip) {
-  const m = logEntriesFor(name, equip);
-  if (m.length < 3) return false;
-  const last3 = m.slice(0, 3);
+  const ses = sessionsFor(name, equip);
+  if (ses.length < 3) return false;
+  const last3 = ses.slice(0, 3);
   const newest = last3[0], oldest = last3[2];
-  const wNoUp = (parseFloat(newest.weight) || 0) <= (parseFloat(oldest.weight) || 0);
-  const rNoUp = (parseInt(newest.reps, 10) || 0) <= (parseInt(oldest.reps, 10) || 0);
+  const wNoUp = newest.topWeight <= oldest.topWeight;
+  const rNoUp = (newest.topReps || 0) <= (oldest.topReps || 0);
   return wNoUp && rNoUp;
 }
 
@@ -672,7 +713,7 @@ function newDay(day, template, minutes) {
   return { id: uid(), day, template, equipment: defaultEquipForDay(day), minutes: minutes != null ? minutes : program[template].minutes };
 }
 
-function makeDraft(mode, startDay) {
+function makeDraft(mode, startDay, targetDate) {
   startDay = startDay || 'Mon';
   let days;
   if (mode === 'intense') {
@@ -685,7 +726,7 @@ function makeDraft(mode, startDay) {
   } else {
     days = PRIORITY.slice(0, 4).map(p => newDay(dayFromOffset(startDay, p.off), p.template));
   }
-  return { mode, days, startDay, deload: false };
+  return { mode, days, startDay, deload: false, targetDate: targetDate || isoDate(new Date()) };
 }
 
 function setWeekCountOptions() {
@@ -718,6 +759,17 @@ function renderWeekDays() {
   setWeekCountOptions();
   document.querySelectorAll('#start-toggle button').forEach(b => b.classList.toggle('active', b.dataset.start === (weekDraft.startDay || 'Mon')));
   document.querySelectorAll('#deload-toggle button').forEach(b => b.classList.toggle('active', (b.dataset.on === 'on') === weekDraft.deload));
+
+  const woInput = document.getElementById('week-of');
+  if (woInput) {
+    woInput.value = weekDraft.targetDate || isoDate(new Date());
+    const wid = isoDate(getWeekStart(new Date(woInput.value + 'T00:00:00')));
+    const curId = isoDate(getWeekStart(new Date()));
+    const exists = weeks.some(w => w.weekId === wid);
+    const note = document.getElementById('week-of-note');
+    if (note) note.textContent = (wid === curId ? 'Current week (week of ' + wid + ').' : 'Building a past week of ' + wid + (exists ? ' (already saved \u2014 loaded for editing).' : ' \u2014 will be saved so you can log into it.'));
+  }
+  renderDeloadNudge();
 
   const wrap = document.getElementById('week-days');
   const tplOptions = (sel) => TEMPLATE_ORDER.map(k => `<option value="${k}" ${k===sel?'selected':''}>${esc(program[k].name)}</option>`).join('');
@@ -756,7 +808,7 @@ function renderWeekDays() {
 }
 
 document.querySelectorAll('#week-mode button').forEach(b => {
-  b.addEventListener('click', () => { weekDraft = makeDraft(b.dataset.mode, weekDraft.startDay); renderWeekDays(); });
+  b.addEventListener('click', () => { weekDraft = makeDraft(b.dataset.mode, weekDraft.startDay, weekDraft.targetDate); renderWeekDays(); });
 });
 document.getElementById('week-count').addEventListener('change', (e) => {
   adjustDraftCount(parseInt(e.target.value, 10));
@@ -770,14 +822,23 @@ document.getElementById('add-day').addEventListener('click', () => {
   renderWeekDays();
 });
 document.querySelectorAll('#start-toggle button').forEach(b => {
-  b.addEventListener('click', () => { weekDraft = makeDraft(weekDraft.mode, b.dataset.start); renderWeekDays(); });
+  b.addEventListener('click', () => { weekDraft = makeDraft(weekDraft.mode, b.dataset.start, weekDraft.targetDate); renderWeekDays(); });
 });
 document.querySelectorAll('#deload-toggle button').forEach(b => {
   b.addEventListener('click', () => { weekDraft.deload = b.dataset.on === 'on'; renderWeekDays(); });
 });
+document.getElementById('week-of').addEventListener('change', (e) => {
+  const val = e.target.value;
+  if (!val) return;
+  const wid = isoDate(getWeekStart(new Date(val + 'T00:00:00')));
+  const existing = weeks.find(w => w.weekId === wid);
+  if (existing) { editWeek(wid); }
+  else { weekDraft.targetDate = val; renderWeekDays(); }
+});
 
 document.getElementById('build-week').addEventListener('click', () => {
-  const weekId = isoDate(getWeekStart(new Date()));
+  const target = weekDraft.targetDate ? new Date(weekDraft.targetDate + 'T00:00:00') : new Date();
+  const weekId = isoDate(getWeekStart(target));
   const days = weekDraft.days.map(d => ({ ...d, id: d.id || uid() }));
   const wk = { weekId, mode: weekDraft.mode, days, startDay: weekDraft.startDay, deload: weekDraft.deload, builtAt: new Date().toISOString() };
   const existingIdx = weeks.findIndex(w => w.weekId === weekId);
@@ -791,12 +852,22 @@ function currentWeek() {
   return weeks.find(w => w.weekId === weekId) || (weeks.length ? weeks[weeks.length - 1] : null);
 }
 
-function editCurrentWeek() {
-  const wk = currentWeek();
+function editWeek(weekId) {
+  const wk = weeks.find(w => w.weekId === weekId);
   if (!wk) return;
-  weekDraft = { mode: 'custom', days: wk.days.map(d => ({ ...d, id: d.id || uid() })), startDay: wk.startDay || (wk.days[0] && wk.days[0].day === 'Sun' ? 'Sun' : 'Mon'), deload: wk.deload };
+  weekDraft = {
+    mode: 'custom',
+    days: wk.days.map(d => ({ ...d, id: d.id || uid() })),
+    startDay: wk.startDay || (wk.days[0] && wk.days[0].day === 'Sun' ? 'Sun' : 'Mon'),
+    deload: wk.deload,
+    targetDate: wk.weekId,
+  };
   renderWeekDays();
   document.getElementById('week-days').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function editCurrentWeek() {
+  const wk = currentWeek();
+  if (wk) editWeek(wk.weekId);
 }
 
 function weekAdherence(wk) {
@@ -805,13 +876,48 @@ function weekAdherence(wk) {
   return { completed, planned: wk.days.length };
 }
 
+const HEAVY_LOWER = ['lowerPower', 'lowerHypertrophy'];
+// True if two heavy lower days fall less than 48h apart (women recover lower-body slower; space them).
+function lowerSpacingWarning(wk) {
+  const times = wk.days.filter(d => HEAVY_LOWER.includes(d.template))
+    .map(d => new Date(dateForWeekday(wk.weekId, d.day) + 'T00:00:00').getTime())
+    .sort((a, b) => a - b);
+  for (let i = 1; i < times.length; i++) { if (times[i] - times[i - 1] < 2 * 86400000) return true; }
+  return false;
+}
+// Count consecutive most-recent weeks that were NOT deloads.
+function nonDeloadStreak() {
+  const sorted = weeks.slice().sort((a, b) => (a.weekId < b.weekId ? 1 : -1));
+  let n = 0;
+  for (const w of sorted) { if (w.deload) break; n++; }
+  return n;
+}
+function renderDeloadNudge() {
+  const el = document.getElementById('deload-nudge');
+  if (!el) return;
+  const streak = nonDeloadStreak();
+  const curId = isoDate(getWeekStart(new Date()));
+  const show = streak >= 6 && ui.deloadNudgeDismissedWeekId !== curId && !(weekDraft && weekDraft.deload);
+  if (!show) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="card" style="border-color:rgba(251,191,36,0.5);">
+    <p class="plateau-note" style="margin:0 0 8px;">It's been ~${streak} weeks since your last deload. A deload week can help you recover and keep progressing.</p>
+    <div class="btn-row"><button class="sm" id="deload-now">Turn on deload</button><button class="sm ghost" id="deload-dismiss">Dismiss</button></div></div>`;
+  document.getElementById('deload-now').addEventListener('click', () => { weekDraft.deload = true; renderWeekDays(); });
+  document.getElementById('deload-dismiss').addEventListener('click', () => { ui.deloadNudgeDismissedWeekId = curId; save(LS.ui, ui); renderDeloadNudge(); });
+}
+
 function renderWeekSummary(wk) {
   const el = document.getElementById('week-summary');
   if (!wk) { el.innerHTML = ''; return; }
   const adh = weekAdherence(wk);
-  let rows = wk.days.map(d => `<tr><td>${d.day}</td><td>${esc(program[d.template] ? program[d.template].name : d.template)}</td><td>${d.minutes}m</td><td>${EQUIP_LABEL[d.equipment]}</td></tr>`).join('');
+  let rows = wk.days.map(d => {
+    const dot = cycle[cycleKey(wk.weekId, d)] ? ' <span style="color:var(--bad)" title="period day">&#9679;</span>' : '';
+    return `<tr><td>${d.day}${dot}</td><td>${esc(program[d.template] ? program[d.template].name : d.template)}</td><td>${d.minutes}m</td><td>${EQUIP_LABEL[d.equipment]}</td></tr>`;
+  }).join('');
+  const spaceWarn = lowerSpacingWarning(wk) ? `<p class="plateau-note">Heads up: your two heavy lower days are less than 48h apart. Consider spacing them out for better lower-body recovery.</p>` : '';
   el.innerHTML = `<div class="card"><h3 style="margin-top:0;">Week of ${wk.weekId} ${wk.deload ? '<span class="pill warn">Deload</span>' : ''}</h3>
     <p class="inline-note">Completed ${adh.completed} / ${adh.planned} planned days</p>
+    ${spaceWarn}
     <table><thead><tr><th>Day</th><th>Workout</th><th>Time</th><th>Equipment</th></tr></thead><tbody>${rows}</tbody></table>
     <div class="btn-row"><button id="edit-week">Edit this week</button><button class="primary" onclick="showTab('print')">Print</button><button onclick="showTab('log')">Log</button></div></div>`;
   const eb = document.getElementById('edit-week');
@@ -822,6 +928,8 @@ function renderWeekSummary(wk) {
    PROGRAM editor
    ============================================================ */
 function markProgramEdited() { ui.programEdited = true; save(LS.ui, ui); save(LS.program, program); }
+
+let progSwap = {}; // exercise index -> { open, equip } (transient editor UI state)
 
 function renderProgram() {
   const sel = document.getElementById('program-pick');
@@ -857,11 +965,14 @@ function renderProgramEditor() {
       </div>
       ${e.cue ? `<div class="ex-cue">${esc(e.cue)}</div>` : ''}
       <div class="inline-note" style="margin-top:6px;">Rest ${fmtRest(e.rest)}</div>
+      <div class="btn-row" style="margin-top:8px;"><button class="sm ghost" data-swap="${i}">Swap variant</button></div>
+      ${(progSwap[i] && progSwap[i].open) ? progSwapPanel(i, e) : ''}
     </div>`;
   });
+  html += `<datalist id="prog-ex-names">${allExerciseNames().map(n => `<option value="${esc(n)}"></option>`).join('')}</datalist>`;
   wrap.innerHTML = html;
 
-  wrap.querySelectorAll('input').forEach(inp => {
+  wrap.querySelectorAll('.prog-inputs input').forEach(inp => {
     inp.addEventListener('change', () => {
       const i = parseInt(inp.dataset.i, 10);
       const f = inp.dataset.f;
@@ -884,6 +995,43 @@ function renderProgramEditor() {
       renderProgramEditor();
     });
   });
+  // Variant swap controls
+  wrap.querySelectorAll('button[data-swap]').forEach(btn => btn.addEventListener('click', () => {
+    const i = parseInt(btn.dataset.swap, 10);
+    progSwap[i] = progSwap[i] || { open: false, equip: 'commercial' };
+    progSwap[i].open = !progSwap[i].open;
+    renderProgramEditor();
+  }));
+  wrap.querySelectorAll('button[data-swapeq]').forEach(btn => btn.addEventListener('click', () => {
+    const i = parseInt(btn.dataset.swapeq, 10);
+    progSwap[i].equip = btn.dataset.eqval;
+    renderProgramEditor();
+  }));
+  wrap.querySelectorAll('button[data-swapsave]').forEach(btn => btn.addEventListener('click', () => {
+    const i = parseInt(btn.dataset.swapsave, 10);
+    const inp = wrap.querySelector(`input[data-swapinput="${i}"]`);
+    const v = inp ? inp.value.trim() : '';
+    const eq = progSwap[i].equip;
+    if (v) { tpl.exercises[i].variants[eq] = v; markProgramEdited(); }
+    progSwap[i].open = false;
+    renderProgramEditor();
+  }));
+  wrap.querySelectorAll('button[data-swapcancel]').forEach(btn => btn.addEventListener('click', () => {
+    const i = parseInt(btn.dataset.swapcancel, 10);
+    progSwap[i].open = false;
+    renderProgramEditor();
+  }));
+}
+
+function progSwapPanel(i, e) {
+  const eq = (progSwap[i] && progSwap[i].equip) || 'commercial';
+  const eqBtns = Object.keys(EQUIP_LABEL).map(k => `<button type="button" class="${k === eq ? 'active' : ''}" data-swapeq="${i}" data-eqval="${k}">${esc(EQUIP_LABEL[k])}</button>`).join('');
+  return `<div class="sub-panel card tight" style="margin-top:8px;">
+    <div class="seg" style="margin-bottom:8px;">${eqBtns}</div>
+    <label class="field" style="margin-bottom:8px;"><span class="lbl">New exercise for ${esc(EQUIP_LABEL[eq])}</span>
+      <input list="prog-ex-names" data-swapinput="${i}" value="${esc(e.variants[eq] || '')}" placeholder="Type or pick a replacement"></label>
+    <div class="btn-row"><button class="primary sm" data-swapsave="${i}">Save as default</button><button class="sm ghost" data-swapcancel="${i}">Cancel</button></div>
+  </div>`;
 }
 
 document.getElementById('add-exercise').addEventListener('click', () => {
@@ -914,32 +1062,73 @@ let logSubs = {};      // rowKey -> substitute name (session only)
 let logSubOpen = {};   // rowKey -> bool
 let logAdhoc = [];     // [{ key, name }]
 let logAddOpen = false;
+let logWeekId = null;  // null = current week; otherwise a chosen (possibly past) weekId
+let logWeek = null;    // resolved week object for the log flow (read by logRowHtml/saveSession)
+let logSplit = {};     // rowKey -> bool (split-set mode, session only)
+let logSplitN = {};    // rowKey -> number of set-lines in split mode
+let logCapture = {};   // rowKey -> snapshot of typed inputs, preserved across in-place re-renders
+
+function getLogWeek() {
+  if (logWeekId) { const w = weeks.find(w => w.weekId === logWeekId); if (w) return w; }
+  return currentWeek();
+}
+function getVal(scope, f) { const el = scope.querySelector(`input[data-f="${f}"]`); return el ? el.value : ''; }
+// Snapshot all currently-typed log inputs so in-place re-renders (toggle split, +/- set, sub) don't lose data.
+function captureLogInputs() {
+  document.querySelectorAll('#log-body .ex-row').forEach(row => {
+    const key = row.dataset.key;
+    if (!key) return;
+    if (row.dataset.split === '1') {
+      const sets = [...row.querySelectorAll('.split-line')].map(line => ({
+        weight: getVal(line, 'weight'), reps: getVal(line, 'reps'), rpe: getVal(line, 'rpe'),
+      }));
+      logCapture[key] = { split: true, sets };
+    } else {
+      logCapture[key] = { split: false, combined: {
+        weight: getVal(row, 'weight'), reps: getVal(row, 'reps'), sets: getVal(row, 'sets'), rpe: getVal(row, 'rpe'),
+      } };
+    }
+  });
+}
 
 function renderLog() {
-  const wk = currentWeek();
+  const wk = getLogWeek();
+  logWeek = wk;
   const body = document.getElementById('log-body');
   if (!wk || !wk.days.length) {
     body.innerHTML = `<div class="empty">No week set up yet.<br><br><button class="primary" onclick="showTab('week')">Set up this week</button></div>`;
     return;
   }
-  // Auto-select today when the week changes.
+  logWeekId = wk.weekId;
+  const curWeekId = isoDate(getWeekStart(new Date()));
+  // Auto-select today when the (current) week changes; past weeks start at day 1.
   if (logAutoWeekId !== wk.weekId) {
+    const isCurrent = wk.weekId === curWeekId;
     const tn = todayDayName();
-    const idx = wk.days.findIndex(d => d.day === tn);
+    const idx = isCurrent ? wk.days.findIndex(d => d.day === tn) : -1;
     logDayIndex = idx >= 0 ? idx : 0;
     logAutoWeekId = wk.weekId;
   }
   if (logDayIndex >= wk.days.length) logDayIndex = 0;
 
   const dayKey = wk.weekId + ':' + logDayIndex;
-  if (logDayKey !== dayKey) { logSubs = {}; logSubOpen = {}; logAdhoc = []; logAddOpen = false; logDayKey = dayKey; }
+  if (logDayKey !== dayKey) { logSubs = {}; logSubOpen = {}; logAdhoc = []; logAddOpen = false; logSplit = {}; logSplitN = {}; logCapture = {}; logDayKey = dayKey; }
 
   const d = wk.days[logDayIndex];
+  const ckey = cycleKey(wk.weekId, d);
+  const cyc = cycle[ckey];
+  const periodOn = !!cyc;
+
+  const sortedWeeks = weeks.slice().sort((a, b) => (a.weekId < b.weekId ? 1 : -1));
+  const weekOpts = sortedWeeks.map(w => `<option value="${w.weekId}" ${w.weekId === wk.weekId ? 'selected' : ''}>${w.weekId === curWeekId ? 'This week' : 'Week of ' + w.weekId}${w.deload ? ' (deload)' : ''}</option>`).join('');
   const tpl = program[d.template];
   const namesList = allExerciseNames();
   const datalist = `<datalist id="ex-names">${namesList.map(n => `<option value="${esc(n)}"></option>`).join('')}</datalist>`;
 
-  const daySeg = wk.days.map((dd, i) => `<button data-i="${i}" class="${i===logDayIndex?'active':''}">${dd.day} &middot; ${esc(program[dd.template] ? program[dd.template].name.split(' ')[0] : '?')}</button>`).join('');
+  const daySeg = wk.days.map((dd, i) => {
+    const dot = cycle[cycleKey(wk.weekId, dd)] ? ' <span style="color:var(--bad)">&#9679;</span>' : '';
+    return `<button data-i="${i}" class="${i===logDayIndex?'active':''}">${dd.day} &middot; ${esc(program[dd.template] ? program[dd.template].name.split(' ')[0] : '?')}${dot}</button>`;
+  }).join('');
 
   const equipSeg = Object.keys(EQUIP_LABEL).map(k => `<button data-eq="${k}" class="${k===d.equipment?'active':''}">${k.charAt(0).toUpperCase()+k.slice(1)}</button>`).join('');
   const moveOpts = DAYS.map(dn => `<option value="${dn}" ${dn===d.day?'selected':''}>${dn}</option>`).join('');
@@ -968,6 +1157,10 @@ function renderLog() {
   });
 
   body.innerHTML = `
+    <div class="card tight" style="margin-bottom:12px;">
+      <label class="field" style="margin-bottom:0;"><span class="lbl">Logging week</span><select id="log-week">${weekOpts}</select></label>
+      <div class="inline-note" style="margin-top:6px;">Backdating? Pick a past week here. Need a week that was never built? <a class="linklike" id="log-setup-past">Set up a past week</a>.</div>
+    </div>
     <div class="seg" id="log-day-seg" style="margin-bottom:12px;">${daySeg}</div>
     <div class="card tight">
       <label class="field" style="margin-bottom:6px;"><span class="lbl">Equipment today</span><div class="seg" id="log-equip">${equipSeg}</div></label>
@@ -975,6 +1168,10 @@ function renderLog() {
         <label class="field" style="margin-bottom:0;"><span class="lbl">Move this day to</span><select id="log-move">${moveOpts}</select></label>
         <div style="flex:0 0 auto;"><button class="sm ghost danger" id="log-remove-day">Remove day</button></div>
       </div>
+      <label class="field" style="margin-top:8px;margin-bottom:0;"><span class="lbl">Period day</span>
+        <div class="seg" id="log-period"><button data-p="off" class="${!periodOn?'active':''}">Off</button><button data-p="on" class="${periodOn?'active':''}">On</button></div></label>
+      ${periodOn ? `<label class="field" style="margin-top:8px;margin-bottom:0;"><span class="lbl">Energy / symptoms (optional)</span><input type="text" id="log-period-note" value="${esc(cyc.note || '')}" placeholder="e.g. low energy, cramps"></label>
+      <div class="inline-note" style="margin-top:6px;">Train by feel &mdash; autoregulate by RPE today.</div>` : ''}
       <div class="inline-note" style="margin-top:8px;">${wk.deload?'<span class="pill warn">Deload</span> ':''}Week of ${wk.weekId}</div>
     </div>
     ${exHtml}
@@ -985,6 +1182,11 @@ function renderLog() {
     ${datalist}`;
 
   // wiring
+  document.getElementById('log-week').addEventListener('change', (e) => {
+    logWeekId = e.target.value; logAutoWeekId = null; logDayKey = ''; renderLog();
+  });
+  const setupPast = document.getElementById('log-setup-past');
+  if (setupPast) setupPast.addEventListener('click', () => showTab('week'));
   document.querySelectorAll('#log-day-seg button').forEach(b => b.addEventListener('click', () => { logDayIndex = parseInt(b.dataset.i, 10); renderLog(); }));
   document.querySelectorAll('#log-equip button').forEach(b => b.addEventListener('click', () => { d.equipment = b.dataset.eq; save(LS.weeks, weeks); renderLog(); }));
   document.getElementById('log-move').addEventListener('change', (e) => { d.day = e.target.value; save(LS.weeks, weeks); renderLog(); });
@@ -994,14 +1196,45 @@ function renderLog() {
       logDayIndex = 0; logDayKey = ''; renderLog();
     }
   });
-  document.querySelectorAll('button[data-sub]').forEach(b => b.addEventListener('click', () => { const k = b.dataset.sub; logSubOpen[k] = !logSubOpen[k]; renderLog(); }));
+  document.querySelectorAll('#log-period button').forEach(b => b.addEventListener('click', () => {
+    captureLogInputs();
+    if (b.dataset.p === 'on') { cycle[ckey] = cycle[ckey] || { period: true }; }
+    else { delete cycle[ckey]; }
+    save(LS.cycle, cycle); renderLog();
+  }));
+  const periodNote = document.getElementById('log-period-note');
+  if (periodNote) periodNote.addEventListener('change', () => { if (cycle[ckey]) { cycle[ckey].note = periodNote.value; save(LS.cycle, cycle); } });
+  document.querySelectorAll('button[data-sub]').forEach(b => b.addEventListener('click', () => { captureLogInputs(); const k = b.dataset.sub; logSubOpen[k] = !logSubOpen[k]; renderLog(); }));
   document.querySelectorAll('input[data-subinput]').forEach(inp => inp.addEventListener('change', () => {
+    captureLogInputs();
     const k = inp.dataset.subinput; const v = inp.value.trim();
     if (v) { logSubs[k] = v; } logSubOpen[k] = false; renderLog();
   }));
-  document.querySelectorAll('a[data-undo]').forEach(a => a.addEventListener('click', () => { delete logSubs[a.dataset.undo]; renderLog(); }));
-  document.querySelectorAll('button[data-rmadhoc]').forEach(b => b.addEventListener('click', () => { logAdhoc = logAdhoc.filter(x => x.key !== b.dataset.rmadhoc); renderLog(); }));
-  document.getElementById('log-add').addEventListener('click', () => { logAddOpen = true; renderLog(); });
+  document.querySelectorAll('a[data-undo]').forEach(a => a.addEventListener('click', () => { captureLogInputs(); delete logSubs[a.dataset.undo]; renderLog(); }));
+  document.querySelectorAll('button[data-rmadhoc]').forEach(b => b.addEventListener('click', () => { captureLogInputs(); logAdhoc = logAdhoc.filter(x => x.key !== b.dataset.rmadhoc); renderLog(); }));
+  document.querySelectorAll('button[data-split]').forEach(b => b.addEventListener('click', () => {
+    captureLogInputs();
+    const k = b.dataset.split;
+    const cur = (logSplit[k] != null) ? logSplit[k] : !!(logCapture[k] && logCapture[k].split);
+    logSplit[k] = !cur;
+    delete logCapture[k]; delete logSplitN[k];
+    renderLog();
+  }));
+  document.querySelectorAll('button[data-setadd]').forEach(b => b.addEventListener('click', () => {
+    captureLogInputs();
+    const k = b.dataset.setadd;
+    const cur = (logCapture[k] && logCapture[k].split) ? logCapture[k].sets.length : (logSplitN[k] || 1);
+    logSplitN[k] = cur + 1;
+    renderLog();
+  }));
+  document.querySelectorAll('button[data-setdel]').forEach(b => b.addEventListener('click', () => {
+    captureLogInputs();
+    const k = b.dataset.setdel;
+    const cur = (logCapture[k] && logCapture[k].split) ? logCapture[k].sets.length : (logSplitN[k] || 1);
+    logSplitN[k] = Math.max(1, cur - 1);
+    renderLog();
+  }));
+  document.getElementById('log-add').addEventListener('click', () => { captureLogInputs(); logAddOpen = true; renderLog(); });
   const addConfirm = document.getElementById('log-add-confirm');
   if (addConfirm) addConfirm.addEventListener('click', () => {
     const v = document.getElementById('log-add-input').value.trim();
@@ -1014,31 +1247,67 @@ function renderLog() {
 }
 
 function logRowHtml(o) {
-  const d = currentWeek().days[logDayIndex];
-  const ex0 = logs.find(l => l.weekId === o.wk.weekId && (l.slot === d.id || (l.slot == null && l.day === d.day)) && l.exercise === o.nm);
+  const d = logWeek.days[logDayIndex];
+  const dayId = dayKeyOf(d);
+  const sessionLogs = logs.filter(l => logSessionMatch(l, o.wk.weekId, dayId, o.nm));
+  const splitLogs = sessionLogs.filter(l => l.setNo != null).sort((a, b) => (a.setNo || 0) - (b.setNo || 0));
+  const combinedLog = sessionLogs.find(l => l.setNo == null);
+
+  const cap = logCapture[o.rowKey];
+  const isSplit = (logSplit[o.rowKey] != null) ? logSplit[o.rowKey] : (cap ? !!cap.split : splitLogs.length > 0);
+
   const sug = suggestWeight(o.nm, o.equip, o.target, o.deload, o.inc);
   const last = lastSession(o.nm, o.equip);
   const stalled = detectPlateau(o.nm, o.equip);
-  const wVal = ex0 ? ex0.weight : (sug != null ? sug : '');
-  const rVal = ex0 ? ex0.reps : '';
-  const sVal = ex0 ? ex0.sets : o.sets;
-  const rpeVal = ex0 ? (ex0.rpe == null ? '' : ex0.rpe) : '';
-  return `<div class="ex-row" data-ex="${esc(o.nm)}" data-key="${esc(o.rowKey)}">
+
+  let inputsHtml;
+  if (!isSplit) {
+    const c = (cap && !cap.split) ? cap.combined : null;
+    const wVal = c ? c.weight : (combinedLog ? combinedLog.weight : (sug != null ? sug : ''));
+    const rVal = c ? c.reps : (combinedLog ? combinedLog.reps : '');
+    const sVal = c ? c.sets : (combinedLog ? combinedLog.sets : o.sets);
+    const rpeVal = c ? c.rpe : (combinedLog ? (combinedLog.rpe == null ? '' : combinedLog.rpe) : '');
+    inputsHtml = `<div class="log-inputs">
+      <label>Weight<input type="number" data-f="weight" step="0.5" value="${wVal}"></label>
+      <label>Reps<input type="number" data-f="reps" value="${rVal}" placeholder="${o.target || ''}"></label>
+      <label>Sets<input type="number" data-f="sets" value="${sVal}"></label>
+      <label>RPE<input type="number" data-f="rpe" step="0.5" min="5" max="10" value="${rpeVal}"></label>
+    </div>`;
+  } else {
+    let n = logSplitN[o.rowKey];
+    if (n == null) n = (cap && cap.split ? cap.sets.length : 0) || splitLogs.length || o.sets || 3;
+    let lines = '';
+    for (let k = 0; k < n; k++) {
+      const capLine = (cap && cap.split) ? cap.sets[k] : null;
+      const sl = splitLogs[k];
+      const wVal = capLine ? capLine.weight : (sl ? sl.weight : (k === 0 && sug != null ? sug : ''));
+      const rVal = capLine ? capLine.reps : (sl ? sl.reps : '');
+      const rpeVal = capLine ? capLine.rpe : (sl ? (sl.rpe == null ? '' : sl.rpe) : '');
+      lines += `<div class="split-line">
+        <span class="split-no">Set ${k + 1}</span>
+        <label class="splitlbl">Weight<input type="number" data-f="weight" step="0.5" value="${wVal}"></label>
+        <label class="splitlbl">Reps<input type="number" data-f="reps" value="${rVal}" placeholder="${o.target || ''}"></label>
+        <label class="splitlbl">RPE<input type="number" data-f="rpe" step="0.5" min="5" max="10" value="${rpeVal}"></label>
+      </div>`;
+    }
+    inputsHtml = `<div class="split-wrap">${lines}
+      <div class="btn-row" style="margin-top:8px;"><button class="sm ghost" data-setadd="${esc(o.rowKey)}">+ set</button><button class="sm ghost" data-setdel="${esc(o.rowKey)}">&minus; set</button></div></div>`;
+  }
+
+  const splitBtn = `<button class="sm ghost ${isSplit ? 'toggle-on' : ''}" data-split="${esc(o.rowKey)}">${isSplit ? 'Combined entry' : 'Split set data'}</button>`;
+  const bottom = o.adhoc
+    ? `<div class="btn-row" style="margin-top:8px;"><button class="sm ghost danger" data-rmadhoc="${esc(o.rowKey)}">Remove</button>${splitBtn}</div>`
+    : `<div class="btn-row" style="margin-top:8px;"><button class="sm ghost" data-sub="${esc(o.rowKey)}">Sub / swap</button>${splitBtn}</div>`;
+
+  return `<div class="ex-row" data-ex="${esc(o.nm)}" data-key="${esc(o.rowKey)}" data-split="${isSplit ? '1' : '0'}">
     <div class="ex-head"><div class="ex-name">${esc(o.nm)} ${stalled ? '<span class="pill warn">stalled</span>' : ''}</div>
       <span class="pill">${o.sets} x ${esc(o.reps || '-')}</span></div>
     <div class="ex-meta">Rest ${fmtRest(o.rest)} &middot; target RPE ${o.rpe}${o.overridden ? ` &middot; <span class="sub-tag">subbed from ${esc(o.planned)} <a data-undo="${esc(o.rowKey)}">undo</a></span>` : ''}${o.adhoc ? ` &middot; <span class="sub-tag">added</span>` : ''}</div>
     ${o.cue ? `<div class="ex-cue">${esc(o.cue)}</div>` : ''}
     ${sug != null ? `<div class="suggest">Suggested: ${sug} lb ${o.deload ? '(deload)' : ''}</div>` : `<div class="suggest muted">First time &mdash; pick a weight</div>`}
     ${last ? `<div class="lasttime">Last: ${last.weight} x ${last.reps}${last.rpe ? ' @' + last.rpe : ''}</div>` : ''}
-    <div class="log-inputs">
-      <label>Weight<input type="number" data-f="weight" step="0.5" value="${wVal}"></label>
-      <label>Reps<input type="number" data-f="reps" value="${rVal}" placeholder="${o.target || ''}"></label>
-      <label>Sets<input type="number" data-f="sets" value="${sVal}"></label>
-      <label>RPE<input type="number" data-f="rpe" step="0.5" min="5" max="10" value="${rpeVal}"></label>
-    </div>
-    ${o.adhoc
-      ? `<div class="btn-row" style="margin-top:8px;"><button class="sm ghost danger" data-rmadhoc="${esc(o.rowKey)}">Remove</button></div>`
-      : `<div class="btn-row" style="margin-top:8px;"><button class="sm ghost" data-sub="${esc(o.rowKey)}">Sub / swap</button></div>`}
+    ${inputsHtml}
+    ${bottom}
     ${(!o.adhoc && logSubOpen[o.rowKey]) ? `<div class="sub-panel"><input list="ex-names" data-subinput="${esc(o.rowKey)}" placeholder="Type or pick a replacement for today"></div>` : ''}
   </div>`;
 }
@@ -1046,31 +1315,45 @@ function logRowHtml(o) {
 function saveSession(wk, d) {
   const rows = [...document.querySelectorAll('#log-body .ex-row')];
   const preLogs = logs.slice();
+  const dayId = dayKeyOf(d);
+  const stampDate = dateForWeekday(wk.weekId, d.day);
   let saved = 0, prCount = 0;
   rows.forEach(row => {
     const nm = row.dataset.ex;
     if (!nm) return;
-    const get = f => { const el = row.querySelector(`input[data-f="${f}"]`); return el ? el.value : ''; };
-    const weight = get('weight');
-    if (weight === '' || weight == null) return;
-    const reps = get('reps');
-    const sets = get('sets');
-    const rpe = get('rpe');
-    const w = parseFloat(weight) || 0, r = parseInt(reps, 10) || 0, s = parseInt(sets, 10) || 0;
-    const volume = w * r * s;
-    const entry = {
-      weekId: wk.weekId, slot: d.id, date: isoDate(new Date()), day: d.day, equipment: d.equipment,
-      exercise: nm, weight: w, reps: r, sets: s, rpe: rpe === '' ? null : parseFloat(rpe), volume,
-    };
-    const prior = preLogs.filter(l => l.exercise === nm && l.equipment === d.equipment
-      && !(l.weekId === wk.weekId && (l.slot === d.id || (l.slot == null && l.day === d.day)) && l.exercise === nm));
-    if (prior.length) {
-      const maxW = prior.reduce((m, l) => Math.max(m, parseFloat(l.weight) || 0), 0);
-      const maxV = prior.reduce((m, l) => Math.max(m, l.volume || 0), 0);
-      if (w > maxW || volume > maxV) prCount++;
+    const split = row.dataset.split === '1';
+    const base = { weekId: wk.weekId, slot: d.id, date: stampDate, day: d.day, equipment: d.equipment, exercise: nm };
+    const newEntries = [];
+    if (split) {
+      [...row.querySelectorAll('.split-line')].forEach((line, k) => {
+        const wv = getVal(line, 'weight');
+        if (wv === '' || wv == null) return;
+        const w = parseFloat(wv) || 0, r = parseInt(getVal(line, 'reps'), 10) || 0;
+        const rpe = getVal(line, 'rpe');
+        newEntries.push({ ...base, weight: w, reps: r, sets: 1, rpe: rpe === '' ? null : parseFloat(rpe), setNo: k + 1, volume: w * r });
+      });
+    } else {
+      const wv = getVal(row, 'weight');
+      if (wv !== '' && wv != null) {
+        const w = parseFloat(wv) || 0, r = parseInt(getVal(row, 'reps'), 10) || 0, s = parseInt(getVal(row, 'sets'), 10) || 0;
+        const rpe = getVal(row, 'rpe');
+        newEntries.push({ ...base, weight: w, reps: r, sets: s, rpe: rpe === '' ? null : parseFloat(rpe), setNo: null, volume: w * r * s });
+      }
     }
-    const idx = logs.findIndex(l => l.weekId === wk.weekId && (l.slot === d.id || (l.slot == null && l.day === d.day)) && l.exercise === nm);
-    if (idx >= 0) logs[idx] = entry; else logs.push(entry);
+    if (!newEntries.length) return;
+    // PR detection vs prior sessions of this lift (excluding the session we're (re)writing).
+    const prior = preLogs.filter(l => l.exercise === nm && l.equipment === d.equipment && !logSessionMatch(l, wk.weekId, dayId, nm));
+    if (prior.length) {
+      const priorSessions = groupSessions(prior);
+      const maxW = priorSessions.reduce((m, s) => Math.max(m, s.topWeight), 0);
+      const maxV = priorSessions.reduce((m, s) => Math.max(m, s.volume), 0);
+      const newTopW = newEntries.reduce((m, e) => Math.max(m, e.weight), 0);
+      const newVol = newEntries.reduce((a, e) => a + (e.volume || 0), 0);
+      if (newTopW > maxW || newVol > maxV) prCount++;
+    }
+    // Replace any existing entries (combined or split) for this session, then write the new ones.
+    logs = logs.filter(l => !logSessionMatch(l, wk.weekId, dayId, nm));
+    newEntries.forEach(e => logs.push(e));
     saved++;
   });
   save(LS.logs, logs);
@@ -1078,6 +1361,18 @@ function saveSession(wk, d) {
   if (!saved) { btn.textContent = 'Nothing to save'; }
   else { btn.textContent = `Saved ${saved}${prCount ? ' \u00b7 ' + prCount + ' PR!' : ''}`; }
   setTimeout(() => { btn.textContent = 'Save session'; }, 2000);
+}
+
+// Group log entries into per-session { topWeight, volume } (entries should already be filtered to one lift).
+function groupSessions(entries) {
+  const map = {};
+  entries.forEach(l => {
+    const k = l.weekId + '|' + (l.slot || l.day);
+    const g = map[k] || (map[k] = { topWeight: 0, volume: 0 });
+    g.topWeight = Math.max(g.topWeight, parseFloat(l.weight) || 0);
+    g.volume += (l.volume || 0);
+  });
+  return Object.values(map);
 }
 
 /* ============================================================
@@ -1104,20 +1399,31 @@ function renderProgress() {
 function renderProgressDetail() {
   const name = ui.progressEx;
   const detail = document.getElementById('progress-detail');
-  const entries = logs.filter(l => l.exercise === name).sort((a,b) => a.date < b.date ? -1 : 1);
+  const entries = logs.filter(l => l.exercise === name && l.weight != null && l.weight !== '');
   if (!entries.length) { detail.innerHTML = ''; return; }
 
-  const first = entries[0], last = entries[entries.length - 1];
-  const gained = (last.weight - first.weight);
+  // Per-session points (works for both combined and split-set logs).
+  const sMap = {};
+  entries.forEach(l => {
+    const k = l.weekId + '|' + (l.slot || l.day);
+    const g = sMap[k] || (sMap[k] = { key: k, weekId: l.weekId, date: l.date, top: 0, topRpe: null, vol: 0 });
+    const w = parseFloat(l.weight) || 0;
+    if (w > g.top) { g.top = w; g.topRpe = (l.rpe == null ? null : l.rpe); }
+    g.vol += (l.volume || 0);
+  });
+  const sessions = Object.values(sMap).sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  const first = sessions[0], last = sessions[sessions.length - 1];
+  const gained = (last.top - first.top);
   const trendCls = gained > 0 ? 'delta-up' : gained < 0 ? 'delta-down' : 'delta-flat';
   const trendSym = gained > 0 ? '&#9650;' : gained < 0 ? '&#9660;' : '&#8594;';
-  const bestW = entries.reduce((m, e) => e.weight > m.weight ? e : m, entries[0]);
+  const bestTop = sessions.reduce((m, s) => Math.max(m, s.top), 0);
 
   const byWeek = {};
   entries.forEach(e => {
     byWeek[e.weekId] = byWeek[e.weekId] || { top: 0, vol: 0 };
-    byWeek[e.weekId].top = Math.max(byWeek[e.weekId].top, e.weight);
-    byWeek[e.weekId].vol += e.volume;
+    byWeek[e.weekId].top = Math.max(byWeek[e.weekId].top, parseFloat(e.weight) || 0);
+    byWeek[e.weekId].vol += (e.volume || 0);
   });
   const weekIds = Object.keys(byWeek).sort();
   let wkRows = '';
@@ -1132,24 +1438,43 @@ function renderProgressDetail() {
     wkRows += `<tr><td>${w}</td><td class="num">${cur.top}</td><td class="num">${Math.round(cur.vol)}</td><td class="num">${delta}</td></tr>`;
   });
 
-  const stalled = detectPlateau(name, last.equipment);
+  const lastEntry = entries.slice().sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+  const stalled = detectPlateau(name, lastEntry.equipment);
+
+  // Cycle-impact comparison (flagged = sessions on period-flagged days).
+  const flaggedS = sessions.filter(s => cycle[s.key]);
+  const unflaggedS = sessions.filter(s => !cycle[s.key]);
+  const mean = (arr, f) => { const xs = arr.map(f).filter(v => v != null && !isNaN(v)); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
+  const fmt = v => (v == null ? '&mdash;' : (Math.round(v * 10) / 10));
+  let cycleBlock = '';
+  if (flaggedS.length) {
+    cycleBlock = `<h3>Cycle impact</h3>
+      <table><thead><tr><th></th><th class="num">Sessions</th><th class="num">Avg top wt</th><th class="num">Avg volume</th><th class="num">Avg RPE</th></tr></thead><tbody>
+        <tr><td>Period days</td><td class="num">${flaggedS.length}</td><td class="num">${fmt(mean(flaggedS, s => s.top))}</td><td class="num">${fmt(mean(flaggedS, s => s.vol))}</td><td class="num">${fmt(mean(flaggedS, s => s.topRpe))}</td></tr>
+        <tr><td>Other days</td><td class="num">${unflaggedS.length}</td><td class="num">${fmt(mean(unflaggedS, s => s.top))}</td><td class="num">${fmt(mean(unflaggedS, s => s.vol))}</td><td class="num">${fmt(mean(unflaggedS, s => s.topRpe))}</td></tr>
+      </tbody></table>
+      <p class="inline-note">For personal autoregulation only &mdash; not phase-based programming. Red dots on the chart mark period days.</p>`;
+  }
 
   detail.innerHTML = `
     <div class="stat-grid">
-      <div class="stat"><div class="v">${last.weight}</div><div class="l">Latest (lb)</div></div>
+      <div class="stat"><div class="v">${last.top}</div><div class="l">Latest (lb)</div></div>
       <div class="stat"><div class="v ${trendCls}">${trendSym} ${Math.abs(gained)}</div><div class="l">Since start (lb)</div></div>
-      <div class="stat"><div class="v">${bestW.weight}</div><div class="l">Best (lb)</div></div>
+      <div class="stat"><div class="v">${bestTop}</div><div class="l">Best (lb)</div></div>
     </div>
     ${stalled ? `<div class="plateau-note">Stalled the last few sessions &mdash; hold the weight and chase an extra rep, or deload this lift.</div>` : ''}
     <h3>Weight over time</h3>
     <canvas id="chart-weight" width="600" height="240"></canvas>
     <h3>Weekly volume</h3>
     <canvas id="chart-vol" width="600" height="240"></canvas>
+    ${cycleBlock}
     <h3>Week over week</h3>
     <table><thead><tr><th>Week</th><th class="num">Top wt</th><th class="num">Volume</th><th class="num">&Delta; vol</th></tr></thead><tbody>${wkRows}</tbody></table>`;
 
-  const wpts = entries.map(e => ({ label: e.date.slice(5), value: e.weight }));
-  drawLineChart(document.getElementById('chart-weight'), wpts, wpts.reduce((bi, p, i, a) => p.value > a[bi].value ? i : bi, 0));
+  const wpts = sessions.map(s => ({ label: s.date.slice(5), value: s.top }));
+  const highlight = wpts.reduce((bi, p, i, a) => p.value > a[bi].value ? i : bi, 0);
+  const flaggedIdx = sessions.map((s, i) => (cycle[s.key] ? i : -1)).filter(i => i >= 0);
+  drawLineChart(document.getElementById('chart-weight'), wpts, highlight, flaggedIdx);
   drawLineChart(document.getElementById('chart-vol'), weekIds.map(w => ({ label: w.slice(5), value: Math.round(byWeek[w].vol) })), -1);
 }
 
@@ -1167,8 +1492,9 @@ function renderAdherenceBlock() {
   el.innerHTML = `<h3>Weekly adherence</h3><table><thead><tr><th>Week</th><th class="num">Days</th><th class="num">Done</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-function drawLineChart(canvas, data, highlightIndex) {
+function drawLineChart(canvas, data, highlightIndex, flaggedIdx) {
   if (!canvas) return;
+  const flagged = new Set(flaggedIdx || []);
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0,0,W,H);
@@ -1185,6 +1511,7 @@ function drawLineChart(canvas, data, highlightIndex) {
   const grid = css.getPropertyValue('--border').trim() || '#2f3a47';
   const muted = css.getPropertyValue('--muted').trim() || '#93a1b0';
   const gold = css.getPropertyValue('--gold').trim() || '#fbbf24';
+  const bad = css.getPropertyValue('--bad').trim() || '#f87171';
 
   ctx.strokeStyle = grid; ctx.fillStyle = muted; ctx.lineWidth = 1;
   ctx.font = '11px -apple-system, Arial, sans-serif';
@@ -1201,8 +1528,8 @@ function drawLineChart(canvas, data, highlightIndex) {
   data.forEach((d, i) => { const px = x(i), py = y(d.value); i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py); });
   ctx.stroke();
   data.forEach((d, i) => {
-    ctx.fillStyle = (i === highlightIndex) ? gold : accent;
-    ctx.beginPath(); ctx.arc(x(i), y(d.value), (i === highlightIndex) ? 4.5 : 3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = flagged.has(i) ? bad : ((i === highlightIndex) ? gold : accent);
+    ctx.beginPath(); ctx.arc(x(i), y(d.value), (i === highlightIndex || flagged.has(i)) ? 4.5 : 3, 0, Math.PI*2); ctx.fill();
   });
 
   ctx.fillStyle = muted;
@@ -1243,14 +1570,18 @@ function renderPRs() {
   logs.forEach(l => { if (l.weight == null || l.weight === '') return; (byEx[l.exercise] = byEx[l.exercise] || []).push(l); });
   const cards = Object.keys(byEx).map(name => {
     const arr = byEx[name];
-    let bw = arr[0], bv = arr[0], b1 = arr[0];
+    let bw = arr[0], b1 = arr[0];
     arr.forEach(l => {
       if ((parseFloat(l.weight)||0) > (parseFloat(bw.weight)||0)) bw = l;
-      if ((l.volume||0) > (bv.volume||0)) bv = l;
       if (epley(l) > epley(b1)) b1 = l;
     });
+    // Best volume is per-session (sum across split sets), not per-entry.
+    const sMap = {};
+    arr.forEach(l => { const k = l.weekId + '|' + (l.slot || l.day); const g = sMap[k] || (sMap[k] = { vol: 0, weekId: l.weekId }); g.vol += (l.volume || 0); });
+    let bv = Object.values(sMap)[0];
+    Object.values(sMap).forEach(s => { if (s.vol > bv.vol) bv = s; });
     const recent = [bw.weekId, bv.weekId].some(w => w === curWeekId || w === prevWeekId);
-    return { name, bw, bv, e1: Math.round(epley(b1)), recent };
+    return { name, bw, bvVol: Math.round(bv.vol), e1: Math.round(epley(b1)), recent };
   }).sort((a, b) => (b.recent - a.recent) || (a.name < b.name ? -1 : 1));
 
   const recentCards = cards.filter(c => c.recent);
@@ -1260,7 +1591,7 @@ function renderPRs() {
     <div class="pr-main">
       <div class="pr-name">${esc(c.name)} ${c.recent ? '<span class="pill warn">new</span>' : ''}</div>
       <div class="pr-line">Best: <strong>${c.bw.weight} lb</strong> x ${c.bw.reps} &middot; ${c.bw.date}</div>
-      <div class="pr-line">Best volume: ${Math.round(c.bv.volume)} &middot; est. 1RM ~${c.e1} lb</div>
+      <div class="pr-line">Best volume: ${c.bvVol} &middot; est. 1RM ~${c.e1} lb</div>
     </div>
   </div>`;
 
@@ -1291,8 +1622,9 @@ function renderPrint() {
       const nm = exName(e, d.equipment);
       return `<tr><td>${esc(nm)}${e.cue ? `<span class="print-cue">${esc(e.cue)}</span>` : ''}</td><td>${e.sets} x ${esc(e.reps)}</td><td>${fmtRest(e.rest)}</td><td>${e.rpe}</td><td class="fill-col"></td><td class="fill-col"></td></tr>`;
     }).join('');
+    const periodMark = cycle[cycleKey(wk.weekId, d)] ? ' <span class="inline-note">(period day)</span>' : '';
     html += `<div class="print-day">
-      <h3>${d.day} &mdash; ${esc(tpl.name)} <span class="inline-note">(${d.minutes} min &middot; ${EQUIP_LABEL[d.equipment]})</span></h3>
+      <h3>${d.day} &mdash; ${esc(tpl.name)} <span class="inline-note">(${d.minutes} min &middot; ${EQUIP_LABEL[d.equipment]})</span>${periodMark}</h3>
       <p class="inline-note"><strong>Warm-up:</strong> ${esc(tpl.warmup)}</p>
       <table class="print-table"><thead><tr><th>Exercise</th><th>Sets x Reps</th><th>Rest</th><th>RPE</th><th>Weight</th><th>Reps done</th></tr></thead><tbody>${rows}</tbody></table>
       <p class="inline-note"><strong>Cool-down:</strong> ${esc(tpl.cooldown)}</p>
@@ -1437,11 +1769,14 @@ function downloadFile(name, text, type) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 function exportJSON() {
-  downloadFile('fitness-agent-backup.json', JSON.stringify({ profile, program, weeks, logs, swaps, ui }, null, 2), 'application/json');
+  downloadFile('fitness-agent-backup.json', JSON.stringify({ profile, program, weeks, logs, swaps, ui, cycle }, null, 2), 'application/json');
 }
 function exportCSV() {
-  const head = 'weekId,date,day,equipment,exercise,weight,reps,sets,rpe,volume\n';
-  const rows = logs.map(l => [l.weekId,l.date,l.day,l.equipment,'"'+String(l.exercise).replace(/"/g,'""')+'"',l.weight,l.reps,l.sets,l.rpe==null?'':l.rpe,l.volume].join(',')).join('\n');
+  const head = 'weekId,date,day,equipment,exercise,weight,reps,sets,rpe,setNo,period,volume\n';
+  const rows = logs.map(l => {
+    const period = cycle[l.weekId + '|' + (l.slot || l.day)] ? 1 : '';
+    return [l.weekId,l.date,l.day,l.equipment,'"'+String(l.exercise).replace(/"/g,'""')+'"',l.weight,l.reps,l.sets,l.rpe==null?'':l.rpe,l.setNo==null?'':l.setNo,period,l.volume].join(',');
+  }).join('\n');
   downloadFile('fitness-agent-logs.csv', head + rows, 'text/csv');
 }
 function importJSON(ev) {
@@ -1458,6 +1793,7 @@ function importJSON(ev) {
       if (data.logs) save(LS.logs, data.logs);
       if (data.swaps) save(LS.swaps, data.swaps);
       if (data.ui) save(LS.ui, data.ui);
+      if (data.cycle) save(LS.cycle, data.cycle);
       location.reload();
     } catch (e) {
       alert('Could not read that file. Make sure it is a Fitness Agent JSON backup.');
